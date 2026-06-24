@@ -80,7 +80,7 @@ CC_RESPONSE_QUALITY       ← LLM-as-Judge scores per response
 |---|---|---|
 | **Home** | — | Executive snapshot: KPIs, surface split, top users, top LLMs, 7-day trend, health pulse |
 | **Setup** | Admin | 5-phase install: objects, defaults, SPs, data load, verify |
-| **Settings** | Admin | App config: eval model, credit pricing, alert email, backfill period |
+| **Settings** | Admin | App config: eval model, credit pricing, alert email, backfill period, alert schedule |
 | **Audit Log** | Admin | All admin actions on this account |
 | **Access Management** | Access & Limits | Grant/revoke Cortex Code access by user or role |
 | **Credit Configuration** | Access & Limits | Credit limits at account → cohort → user level |
@@ -88,15 +88,15 @@ CC_RESPONSE_QUALITY       ← LLM-as-Judge scores per response
 | **Credit Requests** | Access & Limits | Self-service credit increase requests |
 | **Usage Trends** | Usage & Cost | Credit burn over time, DAU, heatmap, spike detection, forecast |
 | **Cost Attribution** | Usage & Cost | Credits by cohort, top users by credits, per-prompt cost |
-| **AI Observability** | Observability | 11-tab span-level intelligence (see Observability Tabs below) |
+| **AI Observability** | Observability | 10-tab span-level intelligence (see Observability Tabs below) |
 | **User Intelligence** | Observability | Full per-user profile: credits, tokens, insights, quality, prompt search |
 | **Prompt Insights** | Responsible AI | Risk dashboard, user governance profiles, full insights feed |
 | **Policy Rules** | Responsible AI | KEYWORD/REGEX/SEMANTIC rule CRUD |
 | **Alerts** | Responsible AI | Alert rules, history, email notifications |
 | **Model Intelligence** | Intelligence | LLM comparison: latency, token economics, LLM-as-Judge, insights, usage share |
 
-### AI Observability Tabs (11 total)
-Activity Trend · Top Users · Model Usage · Tool Calls · Prompt Browser · Sessions · Token Economics · Tool Intelligence · Entrypoints · Quality Scores · Prompt Patterns
+### AI Observability Tabs (10 total)
+Activity Trend · Top Users · Model Usage · Prompt Browser · Sessions · Token Economics (Experimental) · Tool Intelligence · Entrypoints · Quality Scores · Prompt Patterns
 
 ---
 
@@ -126,6 +126,10 @@ Clustered by `EVENT_DATE` for fast date-range queries at 50K+ users.
 | SP | Created by | Purpose |
 |---|---|---|
 | `SP_CC_REFRESH_USAGE_SUMMARIES` | Phase A | Incremental usage/credit aggregation from ACCOUNT_USAGE |
+| `SP_CC_EXPIRE_TEMPORARY_CREDITS` | Phase A | Expires temp overrides — reverts to cohort permanent limit (not account default) |
+| `SP_CC_REVOKE_MODEL_ACCESS(USERS_JSON, MODEL_LIST)` | Phase A | Revokes CORTEX-MODEL-ROLE-* application roles from users (replace-mode cleanup) |
+| `SP_CC_RESOLVE_USER_COHORTS` | Phase A | Resolves CC_USER_COHORT_RESOLVED — first cohort in CC_CREDIT_CONFIG wins |
+| `SP_CC_ENFORCE_MODEL_ACCESS(USERS_JSON, MODEL_LIST)` | Phase A | Grants CORTEX-MODEL-ROLE-* application roles to users (ACCOUNTADMIN-owned) |
 | `SP_CC_CLASSIFY_PROMPTS(LOOKBACK_HOURS)` | Phase C | See detailed steps below |
 | `SP_CC_CHECK_ALERTS(MODE)` | Phase C | Batch + real-time alert evaluation with HTML email |
 | `SP_CC_EVALUATE_RESPONSES(BATCH_SIZE, EVAL_MODEL)` | Phase C | LLM-as-Judge: 4 evaluation dimensions |
@@ -334,13 +338,15 @@ No, that should never happen. If it does it's the JOIN fan-out bug (see above). 
 - Category classification: 5K prompts/night cap, QUALIFY dedup by prompt hash
 
 ## Nightly Task Schedule
-| Task | Schedule |
-|---|---|
-| `CC_REFRESH_USAGE_SUMMARIES` | Every 30 min |
-| `CC_CLASSIFY_PROMPTS_TASK` | 2am UTC |
-| `CC_DAILY_RESET_LIMITS` | Midnight UTC (only if credit limits configured) |
-| `CC_ALERT_CHECK` | Every 5 min |
-| `CC_REALTIME_VIOLATION_ALERT` | Every 1 min (stream-based, HIGH severity only) |
+| Task | Default Schedule | Notes |
+|---|---|---|
+| `CC_REFRESH_USAGE_SUMMARIES` | Every 30 min | |
+| `CC_CLASSIFY_PROMPTS_TASK` | 2am UTC | |
+| `CC_DAILY_RESET_LIMITS` | Midnight UTC | Only if credit limits configured |
+| `CC_ALERT_CHECK` | Every 1 hour | Configurable via Settings → Alert Schedule (15min/30min/1hr/4hr/Disabled) |
+| `CC_REALTIME_VIOLATION_ALERT` | Every 1 hour | Stream-based, HIGH severity only — also configurable via Settings |
+
+Alert schedules are configured with `ALTER ALERT ... SET SCHEDULE = 'USING CRON ...'`. Changed from 1-min/5-min defaults to 1-hour to prevent warehouse spinning.
 
 ## Roles
 | Role | Purpose |
@@ -381,15 +387,42 @@ Tag-based hard enforcement for Cortex Agent objects. Automates REVOKE USAGE when
 
 ## Cache Hit Rate Formula
 
-**Correct formula:** `cache_read / (cache_read + cache_write)` × 100
+**Formula (approximate):** `cache_read / (cache_read + cache_write)` × 100
 
 - `cache_read` = tokens served from cache (hit) — charged at 0.1× base
 - `cache_write` = tokens written to cache for first time (miss) — charged at 1.25× base
-- `input_tokens` = fresh uncached tokens — NOT part of the cache system, excluded from formula
-- This is the standard hits/(hits+misses) ratio used in all Deloitte/McKinsey observability frameworks
-- **GPT models showing 100%:** If `cache_write = 0`, formula gives 100% — this is a data reporting artifact (GPT may not report write tokens separately), not a true hit rate
+- `input_tokens` excluded — Snowflake's `token_count.input` field includes cache tokens in the total, so adding it double-counts
+- **Labelled "(approx)" in UI** — field semantics in `AI_OBSERVABILITY_EVENTS` may vary by account. Use as a directional signal, not official billing data.
+- **GPT models showing 100%:** If `cache_write = 0`, formula gives 100% — data reporting artifact, shown as N/A in latest version
 
-**Previous wrong formula (now fixed):** `cache_read / (cache_read + input)` — was diluting the ratio by including unrelated input tokens.
+---
+
+## Governance Enhancements (Recent)
+
+### Model Tier Replace Mode
+When assigning a tier to a role via **Model Access → Save & Apply**, the app now revokes models from the previous tier that are NOT in the new tier before granting the new ones. Uses `SP_CC_REVOKE_MODEL_ACCESS` (Phase A SP, ACCOUNTADMIN-owned). This applies to both "Role Directly" and "Role Members" enforcement paths.
+
+### Temporary Credit Revert
+When a temporary credit override expires (`SP_CC_EXPIRE_TEMPORARY_CREDITS`), the SP now:
+1. Looks up the user's cohort in `CC_USER_COHORT_RESOLVED`
+2. Finds the cohort's permanent limit in `CC_CREDIT_CONFIG`
+3. Restores to that value via `ALTER USER SET`
+4. Falls back to `ALTER USER UNSET` (account default) only if no cohort is found
+
+**Previous behaviour:** Always did `UNSET` → fell to account default, not cohort limit.
+
+### Alert Schedule Configurability
+**Settings → Alert Schedule** section lets admins change the polling interval for both alerts without running SQL directly. Uses `ALTER ALERT ... SET SCHEDULE = 'USING CRON ...'`. Options: 15min / 30min / 1hr (default) / 4hr / Disabled. Stored in `CC_APP_CONFIG` for persistence.
+
+### Cohort Resolution — Multi-Role Users
+If a user belongs to multiple cohort roles, they are assigned to the **first cohort configured** in `CC_CREDIT_CONFIG` (insertion/creation order). Subsequent cohorts are ignored for that user. To check which cohort a user resolved to:
+```sql
+SELECT USER_NAME, COHORT_ROLE FROM CC_USER_COHORT_RESOLVED WHERE USER_NAME = '<user>';
+```
+User-level override (Credit Config → User Override tab) always wins over cohort regardless.
+
+### Setup Warehouse Hint
+Phase A now shows the current warehouse name and size before creating objects, with a note that XS is sufficient for all setup phases and overnight tasks.
 
 ---
 
@@ -435,7 +468,7 @@ admin:
     # Add customer's own admin role here
 ```
 
-Never hardcode YOUR_DB or YOUR_SCHEMA — those are the developer's personal account values.
+Never hardcode RCHAND or APPS — those are the developer's personal account values.
 
 
 ---

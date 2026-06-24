@@ -50,6 +50,8 @@ Ask the user ALL of these questions before doing anything. Do not proceed until 
 - What is the name of your compute pool? (e.g. `COCO_HUB_POOL`)
 - Runtime: `SYSTEM_STREAMLIT_CONTAINER` (standard)
 
+> **SPCS tip:** Resume the compute pool at least 5 minutes before first use — auto-resume takes 2–3 min. If the pool is stuck in `RESIZING`, run `ALTER COMPUTE POOL <name> SUSPEND` then `RESUME`.
+
 ### Question Set B — Snowflake Target
 
 ```
@@ -58,6 +60,8 @@ Ask the user ALL of these questions before doing anything. Do not proceed until 
    - Schema name (e.g. APPS)
    - Warehouse name (e.g. COMPUTE_WH, COCO_HUB_WH)
 ```
+
+> **Warehouse sizing:** XS is sufficient for setup and overnight tasks. Use S or larger for the app query warehouse if you have many concurrent users. Recommend `AUTO_SUSPEND = 300` to avoid cold-start delays.
 
 ### Question Set C — Data Schema
 
@@ -238,7 +242,7 @@ admin:
     # - DBA_ROLE
 ```
 
-**Important:** Do NOT put your personal dev account name (e.g. YOUR_DB, YOUR_SCHEMA). Leave blank if unsure — the sidebar Deployment Target picker overrides this at runtime.
+**Important:** Do NOT put your personal dev account name (e.g. RCHAND, APPS). Leave blank if unsure — the sidebar Deployment Target picker overrides this at runtime.
 
 ---
 
@@ -338,6 +342,7 @@ After pulling latest code and running `snow streamlit deploy --replace`:
 | `sp_definitions.py` + new data needed | **Phase C** then **Phase D2** (re-backfill) |
 | `prerequisites.sql` (new tables) | **Phase A** (idempotent — safe to re-run) |
 | `config.yaml` admin roles | None — read at runtime |
+| Upgrading from version with 1-min alerts | **Phase A** — recreates `CC_ALERT_CHECK` and `CC_REALTIME_VIOLATION_ALERT` with 1hr default schedule |
 
 ### New column migration (existing install)
 If upgrading from an older version that's missing columns:
@@ -364,6 +369,7 @@ Then redeploy + Phase C + Phase D2.
 
 | Error / Observation | Cause | Fix |
 |---|---|---|
+| App keeps spinning indefinitely after deploy | Alert polling was every 1 min in older versions, keeping warehouse constantly busy | Redeploy (alerts now default to 1hr). Also set `AUTO_SUSPEND=300` on the warehouse |
 | `Database 'X' does not exist` | Wrong connection or snowflake.yml | Check connection and database |
 | `Insufficient privileges to MANAGE GRANTS` | Custom role missing MANAGE GRANTS | Grant it or run Phase A as ACCOUNTADMIN |
 | `AI_OBSERVABILITY_EVENTS not found` | Missing AI Observability reader | Grant `SNOWFLAKE.AI_OBSERVABILITY_READER` to CC_SP_OWNER_ROLE (Account Prerequisites Step 2) |
@@ -378,7 +384,7 @@ Then redeploy + Phase C + Phase D2.
 | Custom Quality (Experimental) scores very low (0.2–0.3) | Evaluating planning steps not final responses | Run Phase C (updated SP), truncate CC_RESPONSE_QUALITY, re-run D4 |
 | Alert health shows STARTED but no alerts fire | All rules disabled in Alert Rules tab | Expected — scheduler runs but nothing triggers. Shows info message in latest version. |
 | "Pii Risk" showing in category chart | Old deploy with .str.title() bug | Redeploy — now shows "PII Risk" correctly |
-| Config.yaml has YOUR_DB/YOUR_SCHEMA | Developer's personal values were left in | Set database/schema to empty string — uses CURRENT_DATABASE/SCHEMA |
+| Config.yaml has RCHAND/APPS | Developer's personal values were left in | Set database/schema to empty string — uses CURRENT_DATABASE/SCHEMA |
 | COCO_HUB_ADMIN role not found | Hardcoded in old config.yaml | Comment it out — config.yaml admin.roles should only have roles that exist in the account |
 
 ---
@@ -413,5 +419,5 @@ TRUNCATE TABLE <db>.<schema>.CC_RESPONSE_QUALITY;
 - **Do NOT** run `prerequisites.sql` directly — it has `__PLACEHOLDER__` tokens. Use Setup Phase A.
 - **Do NOT** enable `CC_DAILY_RESET_LIMITS` task unless you plan to enforce credit limits
 - **Do NOT** drop `CC_SP_OWNER_ROLE` — all SPs execute as this role
-- **Do NOT** leave `YOUR_DB` or `APPS` in config.yaml — use empty strings or your actual values
+- **Do NOT** leave `RCHAND` or `APPS` in config.yaml — use empty strings or your actual values
 - **Do NOT** add a role to config.yaml admin.roles that doesn't exist in the account (causes startup error)
