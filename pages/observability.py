@@ -1185,6 +1185,13 @@ SHOW PARAMETERS LIKE 'AI_SETTINGS' IN ACCOUNT;""", language="sql")
 
         # ── Token Economics ───────────────────────────────────────────────────
         with t_token_econ:
+            st.warning(
+                "⚗️ **Experimental — Token Economics.** Token counts are extracted from "
+                "`AI_OBSERVABILITY_EVENTS` via `SP_CC_CLASSIFY_PROMPTS` and cover `CodingAgent.Step-0` "
+                "planning spans only. Cache Hit Rate is approximate — field semantics may vary by account. "
+                "Use as a directional signal, not as official Snowflake billing data.",
+                icon=None
+            )
             with st.expander("What do these token metrics mean?", expanded=False):
                 st.markdown("""
 | Metric | What it is | What to expect for Cortex Code |
