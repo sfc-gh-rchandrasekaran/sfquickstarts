@@ -5,10 +5,16 @@ Elaborate admin configuration with clear explanations.
 """
 
 import streamlit as st
+import json
 
 from audit import log_activity
-from config import get_current_user
-from utils import get_app_setting, get_session, set_app_setting
+from config import (
+    get_current_user, fq_table, escape_sql_literal,
+    TABLE_AI_BUDGETS, TABLE_AI_BUDGET_USAGE,
+    SP_CREATE_AI_BUDGET, SP_UPDATE_AI_BUDGET, SP_DELETE_AI_BUDGET,
+    AI_BUDGET_DOMAINS,
+)
+from utils import get_app_setting, get_session, set_app_setting, call_sp
 
 
 def render(session):
@@ -396,6 +402,149 @@ Request queues for admin approval with message: "Only 12 credits available acros
             help="When enabled, SP_CC_EVALUATE_RESPONSES runs after each nightly SP_CC_CLASSIFY_PROMPTS run."
         )
 
+    # --- AI Budgets (Snowflake-native, monitoring only) ---
+    st.divider()
+    with st.container(border=True):
+        st.subheader("AI Budgets", help="Native Snowflake Budget objects that track AI credit spend for groups of users. Monitoring and notifications only — does NOT block users or affect daily limits.")
+        st.caption(
+            "AI Budgets track **group-level monthly spend** across selected AI domains using Snowflake tags. "
+            "They trigger notifications but **do not block access** — that is handled by the daily per-user limits above. "
+            "Requires `SNOWFLAKE.BUDGET_CREATOR` role on the SP owner role (granted during Setup Phase A)."
+        )
+
+        # Load existing budgets
+        @st.cache_data(ttl=60, show_spinner=False)
+        def _load_budgets(_session):
+            try:
+                rows = _session.sql(f"""
+                    SELECT b.BUDGET_NAME, b.MONTHLY_LIMIT, b.DOMAINS, b.TAG_NAME, b.TAG_VALUE,
+                           b.SCOPE_OPERATOR, b.CREATED_BY,
+                           COALESCE(SUM(CASE WHEN u.MEASUREMENT_DATE >= DATE_TRUNC('month', CURRENT_DATE())
+                                            THEN u.CREDITS_SPENT ELSE 0 END), 0) AS MTD_CREDITS
+                    FROM {fq_table(_session, TABLE_AI_BUDGETS)} b
+                    LEFT JOIN {fq_table(_session, TABLE_AI_BUDGET_USAGE)} u ON u.BUDGET_NAME = b.BUDGET_NAME
+                    WHERE b.IS_ACTIVE = TRUE
+                    GROUP BY 1,2,3,4,5,6,7
+                    ORDER BY b.BUDGET_NAME
+                """).collect()
+                return rows
+            except Exception:
+                return []
+
+        budgets = _load_budgets(session)
+
+        if budgets:
+            st.markdown("**Active Budgets**")
+            for b in budgets:
+                bname   = str(b["BUDGET_NAME"])
+                blimit  = float(b["MONTHLY_LIMIT"] or 0)
+                bmtd    = float(b["MTD_CREDITS"]   or 0)
+                btag    = f"{b['TAG_NAME']}={b['TAG_VALUE']}" if b["TAG_NAME"] else "All users"
+                domains = b["DOMAINS"] if isinstance(b["DOMAINS"], list) else json.loads(b["DOMAINS"] or '["CORTEX CODE"]')
+                pct     = min(bmtd / blimit * 100, 100) if blimit > 0 else 0
+
+                with st.expander(f"**{bname}** — {blimit:.0f} cr/month | MTD: {bmtd:.2f} cr ({pct:.0f}%) | {btag}"):
+                    st.caption(f"Domains: {', '.join(domains)}")
+                    st.progress(pct / 100)
+
+                    col_l, col_d = st.columns([3, 1])
+                    with col_l:
+                        new_limit = st.number_input(
+                            "Update monthly limit", min_value=1, value=int(blimit), step=10,
+                            key=f"blimit_{bname}",
+                            help="Credits per calendar month. Notifications fire when threshold % is reached."
+                        )
+                        if st.button("Update Limit", key=f"btn_update_{bname}"):
+                            ok, msg = call_sp(session, SP_UPDATE_AI_BUDGET, bname, str(new_limit))
+                            if ok:
+                                st.success(msg)
+                                st.cache_data.clear()
+                            else:
+                                st.error(msg)
+                    with col_d:
+                        if st.button("🗑 Delete", key=f"btn_del_{bname}",
+                                     help="Drops the Snowflake Budget object and deactivates this record."):
+                            ok, msg = call_sp(session, SP_DELETE_AI_BUDGET, bname)
+                            if ok:
+                                st.success(msg)
+                                st.cache_data.clear()
+                            else:
+                                st.error(msg)
+        else:
+            st.info("No active AI Budgets. Create one below.")
+
+        st.markdown("**Create New Budget**")
+        with st.form("form_create_budget", clear_on_submit=True):
+            st.caption(
+                "⚠️ Budget scope is defined by the tag you select. "
+                "Only users with that tag AND using the selected domains count toward the budget. "
+                "Users without the tag are **unaffected**."
+            )
+            bcol1, bcol2 = st.columns(2)
+            with bcol1:
+                new_name  = st.text_input("Budget Name", placeholder="ENGINEERING",
+                                          help="Alphanumeric + underscores only. Will be prefixed CC_BUDGET_.")
+                new_limit = st.number_input("Monthly Limit (credits)", min_value=1, value=100, step=10,
+                                            help="Credits per UTC calendar month.")
+            with bcol2:
+                new_domains = st.multiselect(
+                    "Domains to track", AI_BUDGET_DOMAINS,
+                    default=["CORTEX CODE"],
+                    help="Only selected domains count toward this budget."
+                )
+                scope_op = st.selectbox("Tag operator", ["UNION", "INTERSECTION"],
+                                        help="UNION: user matches ANY tag. INTERSECTION: user must match ALL tags.")
+
+            bcol3, bcol4 = st.columns(2)
+            with bcol3:
+                tag_name  = st.text_input("User Tag Name (optional)",
+                                          placeholder="COST_CENTER",
+                                          help="Fully-qualified tag: DB.SCHEMA.TAG_NAME. Leave blank = all users.")
+            with bcol4:
+                tag_value = st.text_input("User Tag Value (optional)",
+                                          placeholder="ENGINEERING",
+                                          help="Tag value to match. Only users with this tag value are in scope.")
+
+            submitted = st.form_submit_button("Create Budget", type="primary")
+            if submitted:
+                if not new_name or not new_name.replace("_","").isalnum():
+                    st.error("Budget name must be alphanumeric and underscores only.")
+                elif not new_domains:
+                    st.error("Select at least one domain.")
+                elif (tag_name and not tag_value) or (tag_value and not tag_name):
+                    st.error("Provide both Tag Name and Tag Value, or leave both blank.")
+                else:
+                    domains_json = json.dumps(new_domains)
+                    tn = tag_name.strip() or None
+                    tv = tag_value.strip() or None
+                    ok, msg = call_sp(
+                        session, SP_CREATE_AI_BUDGET,
+                        new_name.strip().upper(), str(new_limit),
+                        domains_json,
+                        tn or "", tv or "", scope_op
+                    )
+                    if ok:
+                        log_activity(session, "CREATE_AI_BUDGET",
+                                     details={"name": new_name, "limit": new_limit,
+                                              "domains": new_domains, "tag": f"{tn}={tv}"})
+                        st.success(msg)
+                        st.cache_data.clear()
+                    else:
+                        st.error(msg)
+
+        with st.expander("How AI Budgets work", expanded=False):
+            st.markdown("""
+**AI Budgets** are native Snowflake objects (`SNOWFLAKE.CORE.BUDGET`) that track credit consumption.
+
+- **Monitoring only** — budgets do not block users. Daily per-user limits (set in Credit Configuration) handle enforcement.
+- **Group-level** — you define a tag (e.g. `COST_CENTER = ENGINEERING`) to scope which users count toward the budget.
+- **Selected domains** — only the domains you pick (e.g. CORTEX CODE, AI FUNCTION) are tracked. Other usage is unaffected.
+- **Monthly cycle** — budget resets at the start of each UTC calendar month.
+- **Usage data** — refreshed nightly by `SP_CC_REFRESH_BUDGET_USAGE` task (`CC_REFRESH_BUDGET_USAGE` runs at 2am UTC).
+
+To add notifications, use Snowsight: Admin → Cost Management → Budgets → select your budget → Notifications.
+            """)
+
     # --- Save ---
     st.divider()
     if st.button(
@@ -444,6 +593,9 @@ def _assign_lead(session, cohort_role, lead_user, actor):
             MERGE INTO {tbl} t
             USING (SELECT '{safe_cohort}' AS C, '{safe_user}' AS U) s
                 ON t.COHORT_ROLE = s.C AND t.LEAD_USER = s.U
+            WHEN MATCHED THEN UPDATE SET
+                CAN_APPROVE_CREDITS = TRUE, CAN_APPROVE_MODELS = TRUE,
+                CAN_SET_LIMITS = TRUE, ASSIGNED_BY = '{safe_actor}'
             WHEN NOT MATCHED THEN INSERT
                 (COHORT_ROLE, LEAD_USER, CAN_APPROVE_CREDITS, CAN_APPROVE_MODELS, CAN_SET_LIMITS, ASSIGNED_BY)
             VALUES ('{safe_cohort}', '{safe_user}', TRUE, TRUE, TRUE, '{safe_actor}')

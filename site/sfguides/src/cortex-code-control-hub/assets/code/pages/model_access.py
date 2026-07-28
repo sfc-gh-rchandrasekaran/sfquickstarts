@@ -586,13 +586,23 @@ def _save_model_mapping(session, role_name, models):
     safe_role = escape_sql_literal(role_name)
     actor = escape_sql_literal(get_current_user(session))
     try:
-        session.sql(f"DELETE FROM {tbl} WHERE ROLE_NAME = '{safe_role}'").collect()
+        # Step 1: Upsert all new models first — no window where role has zero models
         for model in models:
             safe_model = escape_sql_literal(model)
             session.sql(f"""
                 INSERT INTO {tbl} (ROLE_NAME, MODEL_NAME, GRANTED_BY, GRANTED_AT)
-                VALUES ('{safe_role}', '{safe_model}', '{actor}', CURRENT_TIMESTAMP())
+                SELECT '{safe_role}', '{safe_model}', '{actor}', CURRENT_TIMESTAMP()
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {tbl}
+                    WHERE ROLE_NAME = '{safe_role}' AND MODEL_NAME = '{safe_model}'
+                )
             """).collect()
+        # Step 2: Remove models no longer in the list (only runs after all inserts succeed)
+        if models:
+            placeholders = ",".join(f"'{escape_sql_literal(m)}'" for m in models)
+            session.sql(f"DELETE FROM {tbl} WHERE ROLE_NAME = '{safe_role}' AND MODEL_NAME NOT IN ({placeholders})").collect()
+        else:
+            session.sql(f"DELETE FROM {tbl} WHERE ROLE_NAME = '{safe_role}'").collect()
         log_activity(session, "SET_MODEL_MAPPING", target_role=role_name,
                      details={"models": models, "count": len(models)})
         st.success(f"✓ Saved {len(models)} model(s) for {role_name}")

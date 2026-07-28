@@ -80,23 +80,24 @@ CC_RESPONSE_QUALITY       ← LLM-as-Judge scores per response
 |---|---|---|
 | **Home** | — | Executive snapshot: KPIs, surface split, top users, top LLMs, 7-day trend, health pulse |
 | **Setup** | Admin | 5-phase install: objects, defaults, SPs, data load, verify |
-| **Settings** | Admin | App config: eval model, credit pricing, alert email, backfill period, alert schedule |
-| **Audit Log** | Admin | All admin actions on this account |
+| **Settings** | Admin | App config: eval model, credit pricing, alert email, backfill period |
+| **Audit Log** | Admin | All admin actions on this account — action types loaded dynamically from CC_AUDIT_LOG |
 | **Access Management** | Access & Limits | Grant/revoke Cortex Code access by user or role |
-| **Credit Configuration** | Access & Limits | Credit limits at account → cohort → user level |
+| **Credit Configuration** | Access & Limits | Credit limits at account → cohort → user level. Cohort limits support -1 (unlimited) |
 | **Model Access** | Access & Limits | Tier management (TIER_1/2/3), role-model assignments |
 | **Credit Requests** | Access & Limits | Self-service credit increase requests |
 | **Usage Trends** | Usage & Cost | Credit burn over time, DAU, heatmap, spike detection, forecast |
-| **Cost Attribution** | Usage & Cost | Credits by cohort, top users by credits, per-prompt cost |
-| **AI Observability** | Observability | 10-tab span-level intelligence (see Observability Tabs below) |
-| **User Intelligence** | Observability | Full per-user profile: credits, tokens, insights, quality, prompt search |
+| **Budget Forecast** | Usage & Cost | Linear regression projections for 7d/30d/90d. Per-cohort breakdown. Requires ≥7 days of data |
+| **Cost Attribution** | Usage & Cost | Credits by cohort, top users by credits, per-request cost breakdown |
+| **AI Observability** | Observability | 11-tab span-level intelligence (see Observability Tabs below) |
+| **User Intelligence** | Observability | Full per-user profile: credits (billing), tokens, insights, quality, prompt search |
 | **Prompt Insights** | Responsible AI | Risk dashboard, user governance profiles, full insights feed |
 | **Policy Rules** | Responsible AI | KEYWORD/REGEX/SEMANTIC rule CRUD |
 | **Alerts** | Responsible AI | Alert rules, history, email notifications |
 | **Model Intelligence** | Intelligence | LLM comparison: latency, token economics, LLM-as-Judge, insights, usage share |
 
-### AI Observability Tabs (10 total)
-Activity Trend · Top Users · Model Usage · Prompt Browser · Sessions · Token Economics (Experimental) · Tool Intelligence · Entrypoints · Quality Scores · Prompt Patterns
+### AI Observability Tabs (11 total)
+Activity Trend · Top Users · Model Usage · Tool Calls · Prompt Browser · Sessions · Token Economics · Tool Intelligence · Entrypoints · Quality Scores · Prompt Patterns
 
 ---
 
@@ -126,10 +127,6 @@ Clustered by `EVENT_DATE` for fast date-range queries at 50K+ users.
 | SP | Created by | Purpose |
 |---|---|---|
 | `SP_CC_REFRESH_USAGE_SUMMARIES` | Phase A | Incremental usage/credit aggregation from ACCOUNT_USAGE |
-| `SP_CC_EXPIRE_TEMPORARY_CREDITS` | Phase A | Expires temp overrides — reverts to cohort permanent limit (not account default) |
-| `SP_CC_REVOKE_MODEL_ACCESS(USERS_JSON, MODEL_LIST)` | Phase A | Revokes CORTEX-MODEL-ROLE-* application roles from users (replace-mode cleanup) |
-| `SP_CC_RESOLVE_USER_COHORTS` | Phase A | Resolves CC_USER_COHORT_RESOLVED — first cohort in CC_CREDIT_CONFIG wins |
-| `SP_CC_ENFORCE_MODEL_ACCESS(USERS_JSON, MODEL_LIST)` | Phase A | Grants CORTEX-MODEL-ROLE-* application roles to users (ACCOUNTADMIN-owned) |
 | `SP_CC_CLASSIFY_PROMPTS(LOOKBACK_HOURS)` | Phase C | See detailed steps below |
 | `SP_CC_CHECK_ALERTS(MODE)` | Phase C | Batch + real-time alert evaluation with HTML email |
 | `SP_CC_EVALUATE_RESPONSES(BATCH_SIZE, EVAL_MODEL)` | Phase C | LLM-as-Judge: 4 evaluation dimensions |
@@ -338,15 +335,13 @@ No, that should never happen. If it does it's the JOIN fan-out bug (see above). 
 - Category classification: 5K prompts/night cap, QUALIFY dedup by prompt hash
 
 ## Nightly Task Schedule
-| Task | Default Schedule | Notes |
-|---|---|---|
-| `CC_REFRESH_USAGE_SUMMARIES` | Every 30 min | |
-| `CC_CLASSIFY_PROMPTS_TASK` | 2am UTC | |
-| `CC_DAILY_RESET_LIMITS` | Midnight UTC | Only if credit limits configured |
-| `CC_ALERT_CHECK` | Every 1 hour | Configurable via Settings → Alert Schedule (15min/30min/1hr/4hr/Disabled) |
-| `CC_REALTIME_VIOLATION_ALERT` | Every 1 hour | Stream-based, HIGH severity only — also configurable via Settings |
-
-Alert schedules are configured with `ALTER ALERT ... SET SCHEDULE = 'USING CRON ...'`. Changed from 1-min/5-min defaults to 1-hour to prevent warehouse spinning.
+| Task | Schedule |
+|---|---|
+| `CC_REFRESH_USAGE_SUMMARIES` | Every 30 min |
+| `CC_CLASSIFY_PROMPTS_TASK` | 2am UTC |
+| `CC_DAILY_RESET_LIMITS` | Midnight UTC (only if credit limits configured) |
+| `CC_ALERT_CHECK` | Every 5 min |
+| `CC_REALTIME_VIOLATION_ALERT` | Every 1 min (stream-based, HIGH severity only) |
 
 ## Roles
 | Role | Purpose |
@@ -385,44 +380,43 @@ Tag-based hard enforcement for Cortex Agent objects. Automates REVOKE USAGE when
 
 ---
 
-## Cache Hit Rate Formula
+## Native Per-User Quotas (Preview) — ⚡ Native Quotas page
 
-**Formula (approximate):** `cache_read / (cache_read + cache_write)` × 100
+Hard per-user monthly/daily credit enforcement using `SNOWFLAKE.CORE.QUOTA` objects. Blocks fire within **minutes** of breach (vs 8 hrs for AI Budgets), auto-release at cycle reset. Covers all of Cortex Code (CLI + Snowsight + Desktop).
 
-- `cache_read` = tokens served from cache (hit) — charged at 0.1× base
-- `cache_write` = tokens written to cache for first time (miss) — charged at 1.25× base
-- `input_tokens` excluded — Snowflake's `token_count.input` field includes cache tokens in the total, so adding it double-counts
-- **Labelled "(approx)" in UI** — field semantics in `AI_OBSERVABILITY_EVENTS` may vary by account. Use as a directional signal, not official billing data.
-- **GPT models showing 100%:** If `cache_write = 0`, formula gives 100% — data reporting artifact, shown as N/A in latest version
+| Aspect | Detail |
+|---|---|
+| **Covers** | CORTEX CODE (all surfaces), AI FUNCTION, CORTEX AGENT, Snowflake Intelligence |
+| **Enforcement** | Within minutes of breach — Snowflake-managed pipeline, no customer SP or scheduling |
+| **Cohort scoping** | Creates `CC_COHORT_TAG` Snowflake tag; tags resolved cohort members via `ALTER USER SET TAG`; scopes quota using `quota!SET_USER_TAGS`. Uses `CC_USER_COHORT_RESOLVED` (no ACCOUNT_USAGE latency) |
+| **Same limit rule** | ALL users in a quota get the same limit. Use separate quota objects for different tiers |
+| **SP** | `SP_CC_MANAGE_QUOTA` — Phase C SP; actions: CREATE, TAG_USERS, GET_CONFIG, GET_ACTIVE_BLOCKS, GET_ENFORCEMENT_HISTORY, SET_LIMIT, DELETE |
+| **Table** | `CC_NATIVE_QUOTAS` — tracks quota objects managed by CoCo (name, cohort, limits, enforcement, tagged users) |
+| **Prerequisites** | `SNOWFLAKE.QUOTA_CREATOR` granted to `CC_SP_OWNER_ROLE`; `CC_COHORT_TAG` tag; `CC_NATIVE_QUOTAS` table — all created by re-running Setup Phase A |
+| **Notifications** | 80% projected + 100% actual thresholds email the user directly |
+| **Overshoot** | Up to ~minutes of spend past the limit before block lands |
+| **NOT for** | Warehouse compute (separate quota type needed; block enforcement not supported for warehouses) |
+
+**Key API methods** (called by `SP_CC_MANAGE_QUOTA`):
+- `quota!SET_PER_USER_LIMIT(N)` / `quota!SET_PER_USER_LIMIT(N, 'DAILY')`
+- `quota!ADD_SHARED_RESOURCE('CORTEX CODE')`
+- `quota!SET_BLOCK_ENFORCEMENT_ENABLED(TRUE)`
+- `quota!ADD_NOTIFICATION_THRESHOLD(80, 'PROJECTED', TRUE)`
+- `quota!GET_ACTIVE_BLOCKS()` / `quota!GET_CONFIG()` / `quota!GET_USERS()`
 
 ---
 
-## Governance Enhancements (Recent)
+## Cache Hit Rate Formula
 
-### Model Tier Replace Mode
-When assigning a tier to a role via **Model Access → Save & Apply**, the app now revokes models from the previous tier that are NOT in the new tier before granting the new ones. Uses `SP_CC_REVOKE_MODEL_ACCESS` (Phase A SP, ACCOUNTADMIN-owned). This applies to both "Role Directly" and "Role Members" enforcement paths.
+**Correct formula:** `cache_read / (cache_read + cache_write)` × 100
 
-### Temporary Credit Revert
-When a temporary credit override expires (`SP_CC_EXPIRE_TEMPORARY_CREDITS`), the SP now:
-1. Looks up the user's cohort in `CC_USER_COHORT_RESOLVED`
-2. Finds the cohort's permanent limit in `CC_CREDIT_CONFIG`
-3. Restores to that value via `ALTER USER SET`
-4. Falls back to `ALTER USER UNSET` (account default) only if no cohort is found
+- `cache_read` = tokens served from cache (hit) — charged at 0.1× base
+- `cache_write` = tokens written to cache for first time (miss) — charged at 1.25× base
+- `input_tokens` = fresh uncached tokens — NOT part of the cache system, excluded from formula
+- This is the standard hits/(hits+misses) ratio used in all Deloitte/McKinsey observability frameworks
+- **GPT models showing 100%:** If `cache_write = 0`, formula gives 100% — this is a data reporting artifact (GPT may not report write tokens separately), not a true hit rate
 
-**Previous behaviour:** Always did `UNSET` → fell to account default, not cohort limit.
-
-### Alert Schedule Configurability
-**Settings → Alert Schedule** section lets admins change the polling interval for both alerts without running SQL directly. Uses `ALTER ALERT ... SET SCHEDULE = 'USING CRON ...'`. Options: 15min / 30min / 1hr (default) / 4hr / Disabled. Stored in `CC_APP_CONFIG` for persistence.
-
-### Cohort Resolution — Multi-Role Users
-If a user belongs to multiple cohort roles, they are assigned to the **first cohort configured** in `CC_CREDIT_CONFIG` (insertion/creation order). Subsequent cohorts are ignored for that user. To check which cohort a user resolved to:
-```sql
-SELECT USER_NAME, COHORT_ROLE FROM CC_USER_COHORT_RESOLVED WHERE USER_NAME = '<user>';
-```
-User-level override (Credit Config → User Override tab) always wins over cohort regardless.
-
-### Setup Warehouse Hint
-Phase A now shows the current warehouse name and size before creating objects, with a note that XS is sufficient for all setup phases and overnight tasks.
+**Previous wrong formula (now fixed):** `cache_read / (cache_read + input)` — was diluting the ratio by including unrelated input tokens.
 
 ---
 
@@ -443,11 +437,11 @@ Phase A now shows the current warehouse name and size before creating objects, w
 
 Before running Phases A–E, admins must run these one-time account-level grants:
 
-1. **Cross-Region Inference** — `ALTER ACCOUNT SET CORTEX_ENABLED_CROSS_REGION = 'ANY'`
-2. **AI Observability Access** — `GRANT DATABASE ROLE SNOWFLAKE.AI_OBSERVABILITY_READER TO ROLE CC_SP_OWNER_ROLE`
+1. **Cross-Region Inference** — `ALTER ACCOUNT SET CORTEX_ENABLED_CROSS_REGION = 'ANY_REGION'` (or `'ANY'` on older accounts)
+2. **AI Observability Access** — `GRANT DATABASE ROLE SNOWFLAKE.AI_OBSERVABILITY_READER TO ROLE CC_SP_OWNER_ROLE` (fallback: `SNOWFLAKE.CORTEX_USER` if role doesn't exist)
 3. **ACCOUNT_USAGE Access** — `GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE TO ROLE CC_SP_OWNER_ROLE`
 4. **Model Access for Users** — `GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO ROLE CC_USER_ROLE`
-5. **Credit Limits** _(optional)_ — `ALTER ACCOUNT SET CORTEX_CODE_CREDIT_LIMIT = N`
+5. **Credit Limits** _(optional)_ — per-surface daily parameters: `ALTER ACCOUNT SET CORTEX_CODE_SNOWSIGHT_DAILY_EST_CREDIT_LIMIT_PER_USER = 20` (also CLI, DESKTOP variants). Old `CORTEX_CODE_CREDIT_LIMIT` is deprecated and no longer exists.
 6. **AI Guardrails** _(optional, Enterprise)_ — `ALTER ACCOUNT SET AI_SETTINGS = $$ guardrails: ... $$`
 7. **Native AI Budgets** _(optional, Preview)_ — tag-based budget enforcement
 
@@ -556,3 +550,71 @@ After deploying updated code (`snow streamlit deploy --replace`):
 6. **Phase D1** — backfill credits (now includes Desktop via `CORTEX_CODE_DESKTOP_USAGE_HISTORY`)
 7. **Phase D2 / 180 days** — re-classify all prompts with correct surface (`CALL SP_CC_CLASSIFY_PROMPTS(4320)`)
 8. **Phase E** — verify all objects
+
+---
+
+## Data Source Clarifications (v3.0 — Critical for Answering Questions)
+
+Understanding which section of the app reads from which source is essential. Numbers will differ between pages because sources have different latency and coverage.
+
+### Two billing sources — which wins?
+
+| Source | Used by | Latency | What it covers |
+|--------|---------|---------|----------------|
+| `CC_USAGE_DAILY_SUMMARY` | Home KPIs, Usage Trends, Cohort summary in Cost Attribution and Observability, User Intelligence Credits tab | ~30 min (SP_CC_REFRESH_USAGE_SUMMARIES runs every 30 min) | All billing: CLI + Snowsight + Desktop |
+| `CORTEX_CODE_*_USAGE_HISTORY` (raw) | Rolling 24h widget on Home, Per-Request breakdown in Cost Attribution | Up to 24h lag | All billing: CLI + Snowsight + Desktop |
+| `CC_PROMPT_EVENTS` | AI Observability KPIs (Total Prompts, Unique Users), User Intelligence Prompts/Activity tabs, Prompt Insights | Nightly (SP_CC_CLASSIFY_PROMPTS at 2am UTC) | Only requests that emitted a CodingAgent.Step-0 observability event |
+
+### Why Cohort total ≠ Per-Request total in Cost Attribution
+
+The Per-Request section joins billing records (`CORTEX_CODE_*_USAGE_HISTORY`) to **`Agent` observability spans** on `REQUEST_ID` — the correct key as of v3.1. Before this fix the code incorrectly joined on `CodingAgent.Step-0.planning.request_id` which only matched 1/119 records (0.076 credits). The correct `Agent.request_id` matches 119/119 (21.45 credits).
+
+A small gap vs Cohort total can still occur for requests with no observability coverage at all — but this is now minimal. The Cohort section uses `CC_USAGE_DAILY_SUMMARY`; if the refresh task is stale, Usage Trends and Cohort section will appear lower than real billing until the SP runs.
+
+### What "session" means — real session ID IS available
+
+In Cost Attribution → **Session Cost Breakdown**, the `SESSION_ID` is now the **real terminal session ID** from `CodingAgentRun.snow.ai.observability.agent.coding_agent.session_id`. Format: `USER:ACCOUNT_REGION:PORT_ID`. Multiple messages in the same Cortex Code CLI session share the same session_id. Falls back to `trace_id` when no `CodingAgentRun` span exists.
+
+`CC_PROMPT_EVENTS.SESSION_ID` is also populated with the real session_id (as of v3.1). Previously it stored `trace_id` (per-message), making the Observability Sessions tab always show depth=1.
+
+**Session span hierarchy:**
+- `Agent` span — root; `request_id` matches billing
+- `CodingAgentRun` span — one per user message; has `session_id`, `message_id`, `thread_id`
+- `CodingAgent.Step-0` / `Step-1` — per agent reasoning step; linked via `trace_id`
+
+### Observability page data cadence
+
+- Account Overview / Cohort / User Search tabs: `CC_USAGE_DAILY_SUMMARY` — 30 min refresh
+- Prompt Intelligence tab: `CC_PROMPT_EVENTS` — **nightly only**
+
+Numbers will differ between these tabs for the same period. A caption on the page explains this.
+
+### User Intelligence dual-source
+
+- **Credits tab**: from `CC_USAGE_DAILY_SUMMARY` (billing) — higher, includes all request types
+- **Prompts/Activity tabs**: from `CC_PROMPT_EVENTS` (observability) — lower, only observed Step-0 spans
+
+Both are correct. The page caption explains the dual-source design.
+
+---
+
+## Key Bug Fixes in v3.0 (for upgrade questions)
+
+| # | File | Bug | Status |
+|---|------|-----|--------|
+| 1 | `sp_definitions.py` | `_SAFE_ID.match()` should be `not _SAFE_ID.search()` — all cohort members excluded, rebalance always fell back | Fixed |
+| 2 | `credit_config.py` | `fq_table('CC_USER_COHORT_RESOLVED')` missing session arg — silently fell back, BFS hierarchy ignored | Fixed |
+| 3 | `settings.py` | `json.loads(str(list))` crash when DOMAINS is a Python list — Active Budgets section never rendered | Fixed |
+| 4 | `model_access.py` | Non-transactional DELETE+INSERT on model save — role had 0 models during save window | Fixed |
+| 5 | `credit_requests.py` | Unlimited user (-1) approval set their limit to just the requested amount | Fixed |
+| 6 | `credit_requests.py` | Model approval updated DB only, never granted the actual model role | Fixed (shows explicit warning to admin) |
+| 7 | `audit_logs.py` | Action type list was hardcoded — model/tier/budget events couldn't be filtered | Fixed (now dynamic from CC_AUDIT_LOG) |
+| 8 | `model_intelligence.py` | Cache savings rate 0.000025 was ~9× too high — should be 0.00000247 (input_rate - cache_rate) | Fixed |
+| 9 | `budget_forecast.py` | Projected credits could go negative on declining usage | Fixed (max(0,…) guard) |
+| 10 | `usage_trends.py` | Same negative guard missing on forecast KPI metric | Fixed |
+| 11 | `home.py` | "Prompt Insights (24h)" used CURRENT_DATE()-1 — actually 48h window | Fixed (now today only) |
+| 12 | `credit_config.py` | Cohort limit min_value=0, couldn't set cohort to unlimited (-1) | Fixed |
+| 13 | `credit_config.py` | SP called with validated values but DB saved original unvalidated values | Fixed |
+| 14 | `settings.py` | `_assign_lead` MERGE missing WHEN MATCHED — re-assigning lead silently failed | Fixed |
+| 15 | `credit_requests.py` | Rate limit today-count used session timezone instead of UTC | Fixed |
+| 16 | `prerequisites.sql` | `USE SCHEMA APP` hardcoded — manual deploy would put objects in wrong schema | Fixed (`USE SCHEMA __SCHEMA__`) |

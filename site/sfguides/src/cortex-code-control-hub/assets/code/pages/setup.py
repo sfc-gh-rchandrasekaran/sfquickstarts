@@ -46,6 +46,11 @@ REQUIRED_TABLES = [
     "CC_ALERT_HISTORY",
     # Response quality scoring
     "CC_RESPONSE_QUALITY",
+    # AI Budget tables
+    "CC_AI_BUDGETS",
+    "CC_AI_BUDGET_USAGE",
+    # Native Per-User Quotas (Preview)
+    "CC_NATIVE_QUOTAS",
 ]
 
 REQUIRED_PROCEDURES = [
@@ -70,6 +75,12 @@ REQUIRED_PROCEDURES = [
     # Alerting + quality SPs
     "SP_CC_CHECK_ALERTS",
     "SP_CC_EVALUATE_RESPONSES",
+    # AI Budget management SPs
+    "SP_CC_CREATE_AI_BUDGET",
+    "SP_CC_UPDATE_AI_BUDGET",
+    "SP_CC_DELETE_AI_BUDGET",
+    "SP_CC_REFRESH_BUDGET_USAGE",
+    "SP_CC_MANAGE_QUOTA",
 ]
 
 REQUIRED_TASKS = [
@@ -78,6 +89,7 @@ REQUIRED_TASKS = [
     "CC_CLASSIFY_PROMPTS_TASK",
     "CC_ALERT_CHECK",
     "CC_REALTIME_VIOLATION_ALERT",
+    "CC_REFRESH_BUDGET_USAGE",
 ]
 
 REQUIRED_INTEGRATIONS = [
@@ -104,6 +116,29 @@ def render(session):
 
     st.header("Setup", help="One-time installation and data bootstrap for CoCo Control Hub.")
     st.caption("Run each phase in order on first install. All phases are idempotent — safe to re-run.")
+
+    with st.expander("📦 Upgrading from an older version?", expanded=False):
+        st.markdown("""
+**After pulling the latest code and running `snow streamlit deploy --replace`:**
+
+| What changed | Action needed |
+|---|---|
+| `pages/*.py` only | None — takes effect on page reload |
+| `sp_definitions.py` | **Phase C** — recreate SPs |
+| New tables or columns in `prerequisites.sql` | **Phase A** (idempotent — safe to re-run) |
+| New prompt columns (e.g. INPUT_TOKENS) on old rows | Truncate `CC_PROMPT_EVENTS` then **Phase D2** with 180 days |
+| `config.yaml` admin roles | None — read at runtime |
+
+**Quick upgrade checklist:**
+```
+1. git pull  (or download latest zip and replace files)
+2. snow streamlit deploy --replace --connection <your_connection>
+3. Open the app → Setup → Run Phase C  (always re-run after code update)
+4. Run Phase A  (only if Phase E shows missing objects)
+5. Run Phase D2  (only if new columns appear blank for old prompts)
+6. Run Phase E  (verify all objects are green)
+```
+        """)
 
     current_role = get_current_role(session)
     is_accountadmin = "ACCOUNTADMIN" in current_role.upper()
@@ -216,7 +251,7 @@ Steps 2, 4 and all Phase A–E DDL you can run yourself.
             "to route inference requests to the nearest region where the model is available — "
             "required for most non-US accounts and for newer models everywhere."
         )
-        st.code("ALTER ACCOUNT SET CORTEX_ENABLED_CROSS_REGION = 'ANY';", language="sql")
+        st.code("ALTER ACCOUNT SET CORTEX_ENABLED_CROSS_REGION = 'ANY_REGION';  -- or 'ANY' on older accounts", language="sql")
 
         st.divider()
 
@@ -225,12 +260,17 @@ Steps 2, 4 and all Phase A–E DDL you can run yourself.
         st.caption(
             f"`SP_CC_CLASSIFY_PROMPTS` reads `SNOWFLAKE.LOCAL.AI_OBSERVABILITY_EVENTS` to backfill "
             f"prompt events, token economics, and latency data. The SP runs as `{ROLE_SP_OWNER}` "
-            f"(owner's rights) — that role needs the `AI_OBSERVABILITY_READER` database role to access the view."
+            f"(owner's rights) — that role needs the `AI_OBSERVABILITY_READER` database role to access the view. "
+            f"If this role doesn't exist in your account, use `SNOWFLAKE.CORTEX_USER` as a fallback (prompt data may not backfill)."
         )
         st.code(f"""\
--- Grant AI Observability read access to the CoCo SP owner role
+-- Primary grant (most accounts — check with: SHOW DATABASE ROLES IN DATABASE SNOWFLAKE)
 GRANT DATABASE ROLE SNOWFLAKE.AI_OBSERVABILITY_READER
-  TO ROLE {ROLE_SP_OWNER};""", language="sql")
+  TO ROLE {ROLE_SP_OWNER};
+
+-- If AI_OBSERVABILITY_READER does not exist in your account, use this fallback:
+-- GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO ROLE {ROLE_SP_OWNER};
+-- Note: CORTEX_USER grants model access but may not cover all observability views.""", language="sql")
 
         st.divider()
 
@@ -276,19 +316,31 @@ GRANT USE AI FUNCTIONS ON ACCOUNT
         # ── 5. Cortex Code Credit Limits (Optional) ───────────────────────────
         st.markdown("#### 5 · Cortex Code Native Credit Limits _(optional)_ &nbsp; `🔐 ACCOUNTADMIN only`")
         st.caption(
-            "Set per-user or account-wide Cortex Code credit budgets. These are enforced natively "
-            "by Snowflake — separate from CoCo's own credit management tables. "
-            "CoCo's credit tracking in CC_USAGE_DAILY_SUMMARY is a governance layer on top of these."
+            "Set **per-surface daily** credit limits for Cortex Code. These are enforced natively by Snowflake "
+            "(separate from CoCo's own credit management tables). CoCo's `CC_USAGE_DAILY_SUMMARY` is a governance "
+            "layer — setting limits here also affects what CoCo can report. "
+            "Note: the old `CORTEX_CODE_CREDIT_LIMIT` parameter (monthly, single-surface) has been replaced "
+            "by per-surface daily parameters."
         )
         st.code("""\
--- Account-wide monthly credit limit for Cortex Code
-ALTER ACCOUNT SET CORTEX_CODE_CREDIT_LIMIT = 1000;
+-- Account-wide daily limits per surface (rolling 24-hour window, per user)
+ALTER ACCOUNT SET CORTEX_CODE_SNOWSIGHT_DAILY_EST_CREDIT_LIMIT_PER_USER = 20;
+ALTER ACCOUNT SET CORTEX_CODE_CLI_DAILY_EST_CREDIT_LIMIT_PER_USER = 20;
+ALTER ACCOUNT SET CORTEX_CODE_DESKTOP_DAILY_EST_CREDIT_LIMIT_PER_USER = 20;
 
--- Per-user monthly limit
-ALTER USER <username> SET CORTEX_CODE_CREDIT_LIMIT = 50;
+-- Per-user override (takes precedence over account-level for that user)
+ALTER USER <username> SET CORTEX_CODE_SNOWSIGHT_DAILY_EST_CREDIT_LIMIT_PER_USER = 50;
+ALTER USER <username> SET CORTEX_CODE_CLI_DAILY_EST_CREDIT_LIMIT_PER_USER = 50;
+ALTER USER <username> SET CORTEX_CODE_DESKTOP_DAILY_EST_CREDIT_LIMIT_PER_USER = 50;
 
--- Check current limits
-SHOW PARAMETERS LIKE 'CORTEX_CODE_CREDIT_LIMIT' IN ACCOUNT;""", language="sql")
+-- Remove a per-user override (reverts to account-level)
+ALTER USER <username> UNSET CORTEX_CODE_SNOWSIGHT_DAILY_EST_CREDIT_LIMIT_PER_USER;
+
+-- Check current account-level limits
+SHOW PARAMETERS LIKE 'CORTEX_CODE%' IN ACCOUNT;
+
+-- Check limits for a specific user
+SHOW PARAMETERS LIKE 'CORTEX_CODE%' FOR USER <username>;""", language="sql")
 
         st.divider()
 
@@ -444,7 +496,7 @@ GRANT OWNERSHIP ON STREAMLIT MY_DB.MY_SCHEMA.CORTEX_CODE_CREDIT_MANAGER
 
     # ── Phase C: Create Stored Procedures ──────────────────────────────────────
     with st.expander("Phase C — Create Stored Procedures", expanded=False):
-        st.caption("Creates 3 stored procedures via `sp_definitions.py`. "
+        st.caption("Creates 5 stored procedures via `sp_definitions.py`. "
                    "`SP_CC_REFRESH_USAGE_SUMMARIES` is created by Phase A (from `prerequisites.sql`).")
         st.markdown("""
 | SP | Created by | Purpose |
@@ -453,13 +505,17 @@ GRANT OWNERSHIP ON STREAMLIT MY_DB.MY_SCHEMA.CORTEX_CODE_CREDIT_MANAGER
 | `SP_CC_CLASSIFY_PROMPTS` | **Phase C** | SQL KEYWORD + REGEX + SEMANTIC classification, categories, cost |
 | `SP_CC_CHECK_ALERTS` | **Phase C** | Batch + real-time alert evaluation with HTML email |
 | `SP_CC_EVALUATE_RESPONSES` | **Phase C** | LLM-as-Judge: Answer Relevance, Groundedness, Coherence, Safety |
+| `SP_CC_REFRESH_BUDGET_USAGE` | **Phase C** | Nightly refresh of AI Budget spending from Snowflake Budget objects |
+| `SP_CC_MANAGE_QUOTA` | **Phase C** | Native per-user quota management (Preview) — create/tag/block/delete |
         """)
         if st.button("Run Phase C — Create Stored Procedures", type="primary", key="btn_sps_c",
-                     help="Creates 3 SPs (SP_CC_REFRESH_USAGE_SUMMARIES is already created by Phase A). Uses CREATE OR REPLACE — safe to re-run."):
+                     help="Creates 5 SPs (SP_CC_REFRESH_USAGE_SUMMARIES is already created by Phase A). Uses CREATE OR REPLACE — safe to re-run."):
             from sp_definitions import (
                 get_classify_sp_ddl,
                 get_check_alerts_sp_ddl,
                 get_evaluate_responses_sp_ddl,
+                get_refresh_budget_usage_sp_ddl,
+                get_manage_quota_sp_ddl,
             )
             from config import get_app_database, get_app_schema
             db = get_app_database(session)
@@ -469,6 +525,8 @@ GRANT OWNERSHIP ON STREAMLIT MY_DB.MY_SCHEMA.CORTEX_CODE_CREDIT_MANAGER
                 ("SP_CC_CLASSIFY_PROMPTS",        lambda: get_classify_sp_ddl(db, schema)),
                 ("SP_CC_CHECK_ALERTS",             lambda: get_check_alerts_sp_ddl(db, schema)),
                 ("SP_CC_EVALUATE_RESPONSES",       lambda: get_evaluate_responses_sp_ddl(db, schema)),
+                ("SP_CC_REFRESH_BUDGET_USAGE",     lambda: get_refresh_budget_usage_sp_ddl(db, schema)),
+                ("SP_CC_MANAGE_QUOTA",             lambda: get_manage_quota_sp_ddl(db, schema)),
             ]:
                 try:
                     ddl = get_ddl_fn()
@@ -984,6 +1042,24 @@ def _run_setup(session):
     except Exception as e:
         bulk_fail += 1
         failed_list.append(f"SP_CC_EVALUATE_RESPONSES: {str(e)[:120]}")
+
+    st.caption("Creating SP_CC_REFRESH_BUDGET_USAGE (AI Budget nightly refresh)...")
+    try:
+        from sp_definitions import get_refresh_budget_usage_sp_ddl
+        session.sql(get_refresh_budget_usage_sp_ddl(db, schema)).collect()
+        bulk_ok += 1
+    except Exception as e:
+        bulk_fail += 1
+        failed_list.append(f"SP_CC_REFRESH_BUDGET_USAGE: {str(e)[:120]}")
+
+    st.caption("Creating SP_CC_MANAGE_QUOTA (Native per-user quotas — Preview)...")
+    try:
+        from sp_definitions import get_manage_quota_sp_ddl
+        session.sql(get_manage_quota_sp_ddl(db, schema)).collect()
+        bulk_ok += 1
+    except Exception as e:
+        bulk_fail += 1
+        failed_list.append(f"SP_CC_MANAGE_QUOTA: {str(e)[:120]}")
 
     total_success = successes + bulk_ok
     total_fail = failures + bulk_fail

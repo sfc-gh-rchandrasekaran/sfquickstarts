@@ -267,7 +267,7 @@ def _execute_grants_to_users(session, users, db_roles):
 
 def _execute_grants_to_role(session, role_name, db_roles):
     """Grant database roles to an account role (not individual users)."""
-    safe_role = sql_identifier(role_name.strip('"'))
+    safe_role = sql_identifier(role_name)
     successes, failures = 0, 0
     for db_role in db_roles:
         try:
@@ -292,10 +292,10 @@ def _execute_role_to_role_grants(session, source_role, target_roles):
     Enterprise pattern: the AI role carries CORTEX_USER/COPILOT_USER and
     domain roles inherit access without direct DB-role grants.
     """
-    safe_src = sql_identifier(source_role.strip('"'))
+    safe_src = sql_identifier(source_role)
     successes, failures = 0, 0
     for target in target_roles:
-        safe_tgt = sql_identifier(target.strip('"'))
+        safe_tgt = sql_identifier(target)
         try:
             session.sql(f'GRANT ROLE {safe_src} TO ROLE {safe_tgt}').collect()
             successes += 1
@@ -355,7 +355,7 @@ def _render_current(session):
                                             help="Executes REVOKE DATABASE ROLE from selected roles."):
                 for target in revoke_targets:
                     try:
-                        safe_target = sql_identifier(target.strip('"'))
+                        safe_target = sql_identifier(target)
                         session.sql(f'REVOKE DATABASE ROLE SNOWFLAKE.CORTEX_USER FROM ROLE {safe_target}').collect()
                         log_activity(session, "REVOKE_ACCESS", target_role=target,
                                      details={"database_role": "SNOWFLAKE.CORTEX_USER"})
@@ -384,7 +384,7 @@ def _render_current(session):
         )
         if inspect_src:
             try:
-                safe_src = sql_identifier(inspect_src.strip('"'))
+                safe_src = sql_identifier(inspect_src)
                 gdf = session.sql(f'SHOW GRANTS OF ROLE {safe_src}').to_pandas()
                 if not gdf.empty:
                     gdf.columns = [c.strip('"').upper() for c in gdf.columns]
@@ -412,7 +412,7 @@ def _render_current(session):
                             help="Executes REVOKE ROLE <source> FROM ROLE <target>."
                         ):
                             for tgt in revoke_r2r:
-                                safe_tgt = sql_identifier(tgt.strip('"'))
+                                safe_tgt = sql_identifier(tgt)
                                 try:
                                     session.sql(
                                         f'REVOKE ROLE {safe_src} FROM ROLE {safe_tgt}'

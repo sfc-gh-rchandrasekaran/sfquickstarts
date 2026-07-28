@@ -128,8 +128,24 @@ def _render_cohort(session):
                                    help="All members of this role get the configured limit.")
         if chosen_role:
             cohort_identifier = chosen_role
-            members = get_role_members(session, chosen_role)
-            st.info(f"**{len(members)}** members in `{chosen_role}`")
+            # Try resolved members first (includes inherited hierarchy); fall back to direct grants
+            try:
+                resolved_rows = session.sql(f"""
+                    SELECT USER_NAME FROM {fq_table(session, 'CC_USER_COHORT_RESOLVED')}
+                    WHERE UPPER(COHORT_ROLE) = UPPER('{chosen_role.replace("'","''")}')
+                """).collect()
+                if resolved_rows:
+                    members = [str(r[0]) for r in resolved_rows]
+                    st.info(f"**{len(members)}** members in `{chosen_role}` (including inherited roles)")
+                else:
+                    members = get_role_members(session, chosen_role)
+                    if members:
+                        st.info(f"**{len(members)}** direct members in `{chosen_role}`")
+                    else:
+                        st.info(f"**0** members found. Click Apply — the SP will resolve members including inherited roles.")
+            except Exception:
+                members = get_role_members(session, chosen_role)
+                st.info(f"**{len(members)}** members in `{chosen_role}`")
     else:
         # Tag-based cohort
         tag_name = st.text_input("Tag Name", value="DEPARTMENT", key="cohort_tag_name",
@@ -149,14 +165,14 @@ def _render_cohort(session):
     # Limit configuration
     col1, col2, col3 = st.columns(3)
     with col1:
-        cli_limit = st.number_input("CLI Daily Limit", min_value=0, value=10, step=1,
-                                    key="cohort_cli", help="Per-user daily CLI credit budget.")
+        cli_limit = st.number_input("CLI Daily Limit", min_value=-1, value=10, step=1,
+                                    key="cohort_cli", help="Per-user daily CLI credit budget. -1 = unlimited.")
     with col2:
-        ss_limit = st.number_input("Snowsight Daily Limit", min_value=0, value=10, step=1,
-                                   key="cohort_ss", help="Per-user daily Snowsight credit budget.")
+        ss_limit = st.number_input("Snowsight Daily Limit", min_value=-1, value=10, step=1,
+                                   key="cohort_ss", help="Per-user daily Snowsight credit budget. -1 = unlimited.")
     with col3:
-        dt_limit = st.number_input("Desktop Daily Limit", min_value=0, value=10, step=1,
-                                   key="cohort_dt", help="Per-user daily Desktop (VS Code/Cursor) credit budget.")
+        dt_limit = st.number_input("Desktop Daily Limit", min_value=-1, value=10, step=1,
+                                   key="cohort_dt", help="Per-user daily Desktop (VS Code/Cursor) credit budget. -1 = unlimited.")
 
     # Temporary vs Permanent
     st.divider()
@@ -172,12 +188,31 @@ def _render_cohort(session):
 
     # Apply button
     if members:
-        if st.button("Apply to Cohort", type="primary", key="btn_cohort_apply",
+        if st.button(f"Apply to Cohort ({len(members)} members)", type="primary", key="btn_cohort_apply",
                      help=f"Sets limits on {len(members)} users. {'Reverts on ' + str(expires_at) if expires_at else 'Permanent.'}"):
             _apply_cohort(session, cohort_identifier, members, cli_limit, ss_limit, dt_limit,
                          is_temporary=(duration_type == "Temporary"), expires_at=expires_at)
     else:
-        st.caption("No members found. Configure the cohort above.")
+        if st.button("Apply to Cohort", type="primary", key="btn_cohort_apply",
+                     help="Saves config and triggers SP to resolve members via full role hierarchy."):
+            _apply_cohort(session, cohort_identifier, members, cli_limit, ss_limit, dt_limit,
+                         is_temporary=(duration_type == "Temporary"), expires_at=expires_at)
+
+    # Monthly Budget (optional, app-tracked)
+    with st.expander("Monthly Budget (optional)", expanded=False):
+        st.caption(
+            "Set a monthly credit budget for this cohort. This is **app-tracked only** — "
+            "it does not enforce a hard block. Admins see MTD spend vs budget in Usage Trends. "
+            "**Separate from the daily limits above** (those are enforced by Snowflake natively)."
+        )
+        saved_monthly = _get_monthly_budget(session, cohort_identifier, "COHORT")
+        monthly_limit = st.number_input(
+            "Monthly Credit Budget", min_value=-1, value=saved_monthly, step=10,
+            key="cohort_monthly",
+            help="-1 = no monthly budget. 0 = flag any usage. Positive = monthly credit cap for this cohort."
+        )
+        if st.button("Save Monthly Budget", key="btn_cohort_monthly"):
+            _save_monthly_budget(session, cohort_identifier, "COHORT", monthly_limit)
 
 
 def _render_user_override(session):
@@ -241,8 +276,10 @@ def _render_user_override(session):
         if st.button("Apply Override", type="primary", key="btn_override_apply",
                      help="ALTER USER SET for this user."):
             all_ok = True
+            validated_vals = {}
             for surface, val in [("CLI", cli_val), ("SNOWSIGHT", ss_val), ("DESKTOP", dt_val)]:
                 validated = int(validate_credit_limit(val))
+                validated_vals[surface] = validated
                 ok, msg = call_sp(session, SP_SET_USER_CREDIT_LIMIT, chosen_user, surface, str(validated))
                 if ok:
                     log_activity(session, "SET_USER_OVERRIDE", target_user=chosen_user,
@@ -255,7 +292,8 @@ def _render_user_override(session):
                     st.error(f"✗ {surface}: {msg}")
 
             if all_ok:
-                _save_user_config(session, chosen_user, cli_val, ss_val,
+                _save_user_config(session, chosen_user,
+                                 validated_vals["CLI"], validated_vals["SNOWSIGHT"], validated_vals["DESKTOP"],
                                  is_temporary=(duration_type == "Temporary"), expires_at=expires_at)
 
     with col_b:
@@ -274,6 +312,21 @@ def _render_user_override(session):
             except Exception:
                 pass
             st.success(f"✓ Override removed for {chosen_user}")
+
+    # Monthly Budget for this user (optional, app-tracked)
+    with st.expander("Monthly Budget (optional)", expanded=False):
+        st.caption(
+            "Set a monthly credit budget for this user. **App-tracked only** — "
+            "does not enforce a hard block and does not affect the daily limits above."
+        )
+        saved_u_monthly = _get_monthly_budget(session, chosen_user, "USER_OVERRIDE")
+        u_monthly = st.number_input(
+            "Monthly Credit Budget", min_value=-1, value=saved_u_monthly, step=10,
+            key="user_monthly",
+            help="-1 = no budget. Positive = monthly credit cap for display/alerting."
+        )
+        if st.button("Save Monthly Budget", key="btn_user_monthly"):
+            _save_monthly_budget(session, chosen_user, "USER_OVERRIDE", u_monthly)
 
 
 # --- Helper Functions ---
@@ -297,6 +350,69 @@ def _get_users_by_tag(session, tag_name: str, tag_value: str) -> list:
     except Exception:
         pass
     return []
+
+
+def _get_monthly_budget(session, identifier: str, config_type: str) -> int:
+    """Load saved MONTHLY_LIMIT for a cohort or user. Returns -1 if not set."""
+    from config import TABLE_CREDIT_CONFIG, escape_sql_literal, fq_table
+    tbl = fq_table(session, TABLE_CREDIT_CONFIG)
+    safe_id = escape_sql_literal(identifier)
+    id_col = "ROLE_NAME" if config_type == "COHORT" else "USER_NAME"
+    try:
+        rows = session.sql(f"""
+            SELECT COALESCE(MONTHLY_LIMIT, -1) AS ML
+            FROM {tbl}
+            WHERE CONFIG_TYPE = '{config_type}'
+              AND {id_col} = '{safe_id}'
+              AND IS_ACTIVE = TRUE
+            LIMIT 1
+        """).collect()
+        return int(rows[0][0]) if rows else -1
+    except Exception:
+        return -1
+
+
+def _save_monthly_budget(session, identifier: str, config_type: str, monthly_limit: int):
+    """
+    Saves MONTHLY_LIMIT to CC_CREDIT_CONFIG for a cohort or user.
+
+    Control note: ONLY writes MONTHLY_LIMIT column. Does NOT call ALTER USER,
+    does NOT change CLI_DAILY_LIMIT / SNOWSIGHT_DAILY_LIMIT / DESKTOP_DAILY_LIMIT.
+    Monthly budget is app-tracked for display purposes only — not natively enforced.
+
+    Requires the row to already exist (created by Apply to Cohort / Apply Override).
+    Shows a clear warning if no matching row found.
+    """
+    from config import TABLE_CREDIT_CONFIG, escape_sql_literal, fq_table, get_current_user
+    tbl = fq_table(session, TABLE_CREDIT_CONFIG)
+    actor = get_current_user(session)
+    safe_actor = escape_sql_literal(actor)
+    safe_id = escape_sql_literal(identifier)
+    id_col = "ROLE_NAME" if config_type == "COHORT" else "USER_NAME"
+    ml_val = str(monthly_limit) if monthly_limit != -1 else "NULL"
+    try:
+        result = session.sql(f"""
+            UPDATE {tbl}
+            SET MONTHLY_LIMIT = {ml_val},
+                UPDATED_BY = '{safe_actor}',
+                UPDATED_AT = CURRENT_TIMESTAMP()
+            WHERE CONFIG_TYPE = '{config_type}'
+              AND {id_col} = '{safe_id}'
+              AND IS_ACTIVE = TRUE
+        """).collect()
+        # Check rows updated — UPDATE returns a row with number_of_rows_updated
+        rows_updated = int(result[0][0]) if result else 0
+        if rows_updated == 0:
+            st.warning(
+                f"No saved config found for **{identifier}**. "
+                f"Click **Apply {'to Cohort' if config_type == 'COHORT' else 'Override'}** first "
+                f"to save the daily limits, then set the monthly budget."
+            )
+        else:
+            msg = f"Monthly budget {'cleared' if monthly_limit == -1 else f'set to {monthly_limit} credits/month'} for {identifier}."
+            st.success(msg)
+    except Exception as e:
+        st.error(f"Failed to save monthly budget: {e}")
 
 
 def _apply_cohort(session, cohort_id, members, cli_limit, ss_limit, dt_limit, is_temporary=False, expires_at=None):
@@ -326,8 +442,21 @@ def _apply_cohort(session, cohort_id, members, cli_limit, ss_limit, dt_limit, is
         return
 
     if not members:
-        st.warning("Config saved but no members to apply to.")
-        return
+        # No direct members — call resolve SP first to populate via role hierarchy
+        try:
+            with st.spinner("Resolving cohort members via role hierarchy..."):
+                session.sql(f"CALL {fq_table(session, 'SP_CC_RESOLVE_USER_COHORTS')}()").collect()
+            resolved_rows = session.sql(f"""
+                SELECT USER_NAME FROM {fq_table(session, 'CC_USER_COHORT_RESOLVED')}
+                WHERE UPPER(COHORT_ROLE) = UPPER('{safe_cohort}')
+            """).collect()
+            members = [str(r[0]) for r in resolved_rows]
+        except Exception as e:
+            st.warning(f"Config saved but could not resolve members: {e}")
+            return
+        if not members:
+            st.warning("Config saved but no members found — check that the role has users assigned (directly or via inherited roles).")
+            return
 
     # --- 2. Single bulk SP call — server-side loop, no CLIENT_ABORT risk ---
     expires_str = str(expires_at) if expires_at else ""
@@ -470,7 +599,7 @@ CALL ai_agent_budget!SET_NOTIFICATION_THRESHOLD(80);
         )
 
 
-def _save_user_config(session, username, cli_val, ss_val, is_temporary=False, expires_at=None):
+def _save_user_config(session, username, cli_val, ss_val, dt_val=None, is_temporary=False, expires_at=None):
     """Save user override to config table."""
     tbl = fq_table(session, TABLE_CREDIT_CONFIG)
     safe_user = escape_sql_literal(username)
