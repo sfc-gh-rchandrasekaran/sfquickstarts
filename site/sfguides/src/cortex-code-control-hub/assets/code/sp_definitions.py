@@ -780,9 +780,9 @@ def handler(session, lookback_hours):
             clean['EVENT_TS'] = clean['EVENT_TS'].dt.strftime('%Y-%m-%d %H:%M:%S')
             clean['EVENT_DATE'] = _pd.to_datetime(clean['EVENT_DATE'], errors='coerce').dt.strftime('%Y-%m-%d')
             # Cap lengths and fill nulls
-            clean['PROMPT']             = clean['PROMPT'].fillna('').str[:4000]
+            clean['PROMPT']             = clean['PROMPT'].fillna('').str[:16000]
             clean['TOOLS_RAW']          = clean['TOOLS_RAW'].fillna('').str[:500]
-            clean['RESPONSE']           = clean['RESPONSE'].fillna('').str[:8000]
+            clean['RESPONSE']           = clean['RESPONSE'].fillna('').str[:16000]
             clean['SESSION_ID']         = clean['SESSION_ID'].fillna('').str[:255]
             clean['REQUEST_ID']         = clean['REQUEST_ID'].fillna('').str[:255]
             clean['USER_NAME']          = clean['USER_NAME'].fillna('').str[:255]
@@ -854,7 +854,7 @@ def handler(session, lookback_hours):
                     r.RULE_ID, r.RULE_NAME, r.RISK_LEVEL, r.CATEGORY,
                     e.USER_NAME, COALESCE(e.SESSION_ID, ''),
                     SHA2(e.{field}, 256),
-                    LEFT(e.{field}, 300),
+                    LEFT(e.{field}, 2000),
                     'KEYWORD', 1.0, '{content_type}'
                 FROM {DB_SCHEMA}.CC_PROMPT_EVENTS e
                 CROSS JOIN {DB_SCHEMA}.CC_POLICY_RULES r
@@ -986,7 +986,7 @@ def handler(session, lookback_hours):
                     for _,inst in idf.iterrows():
                         violations.append({'rule_id':int(rule['RULE_ID']),'rule_name':str(rule['RULE_NAME']),
                             'user_name':str(inst['USER_NAME']),'session_id':str(inst['SESSION_ID'] or ''),
-                            'prompt_hash':ph,'prompt_preview':str(inst['TXT'] or '')[:200],
+                            'prompt_hash':ph,'prompt_preview':str(inst['TXT'] or '')[:2000],
                             'match_type':'SEMANTIC','match_score':1.0,'risk_level':str(rule['RISK_LEVEL']),
                             'category':str(rule['CATEGORY']),'violation_date':str(inst['USAGE_DATE']),
                             'content_type':content_type}); svc+=1
