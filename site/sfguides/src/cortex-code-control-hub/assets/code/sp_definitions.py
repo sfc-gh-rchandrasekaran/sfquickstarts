@@ -723,10 +723,11 @@ def handler(session, lookback_hours):
                    e.RECORD_ATTRIBUTES['snow.ai.observability.agent.planning.token_count.cache_write_input']::INT AS CACHE_WRITE_TOKENS,
                    e.RECORD_ATTRIBUTES['snow.ai.observability.agent.planning.step_number']::INT AS STEP_NUMBER,
                    e.RECORD_ATTRIBUTES['snow.ai.observability.agent.planning.tool_selection.name']::STRING AS TOOLS_RAW,
-                    COALESCE(
-                        run.RECORD_ATTRIBUTES['snow.ai.observability.agent.coding_agent.session_id']::STRING,
-                        e.TRACE['trace_id']::STRING
-                    ) AS SESSION_ID,
+                     COALESCE(
+                         run.RECORD_ATTRIBUTES['snow.ai.observability.agent.coding_agent.session_id']::STRING,
+                         e.TRACE['trace_id']::STRING,
+                         e.RECORD_ATTRIBUTES['snow.ai.observability.agent.planning.request_id']::STRING
+                     ) AS SESSION_ID,
                    run.RECORD_ATTRIBUTES['snow.ai.observability.agent.response']::STRING AS RESPONSE,
                    COALESCE(run.RECORD_ATTRIBUTES['snow.ai.observability.agent.coding_agent.private_mode']::BOOLEAN, FALSE) AS PRIVATE_MODE,
                    -- origin_application is always populated with exactly 3 known values
@@ -1616,7 +1617,7 @@ def handler(session):
 def get_manage_quota_sp_ddl(db: str, schema: str) -> str:
     """Return CREATE OR REPLACE PROCEDURE DDL for SP_CC_MANAGE_QUOTA.
 
-    Wraps Snowflake SNOWFLAKE.CORE.QUOTA object operations (Preview feature).
+    Wraps Snowflake SNOWFLAKE.CORE.QUOTA object operations (GA Aug 2026).
     Actions: CREATE, TAG_USERS, GET_CONFIG, GET_ACTIVE_BLOCKS,
              GET_ENFORCEMENT_HISTORY, SET_LIMIT, DELETE.
     Runs EXECUTE AS OWNER so CC_SP_OWNER_ROLE (which holds SNOWFLAKE.QUOTA_CREATOR)
@@ -1679,19 +1680,21 @@ def handler(session, action, quota_name, params):
 
         if block_enforce:
             try:
-                session.sql(f"CALL {{fq}}!SET_BLOCK_ENFORCEMENT_ENABLED(TRUE)").collect()
+                # GA: second arg TRUE sends end-user email notification when blocked
+                session.sql(f"CALL {{fq}}!SET_BLOCK_ENFORCEMENT_ENABLED(TRUE, TRUE)").collect()
             except Exception as e:
                 errors.append(f"SET_BLOCK_ENFORCEMENT_ENABLED: {{str(e)[:120]}}")
 
         if notify_80:
             try:
-                session.sql(f"CALL {{fq}}!ADD_NOTIFICATION_THRESHOLD(80, \'PROJECTED\', TRUE)").collect()
+                # GA: 4th arg specifies MONTHLY or DAILY threshold scope
+                session.sql(f"CALL {{fq}}!ADD_NOTIFICATION_THRESHOLD(80, \'PROJECTED\', TRUE, \'MONTHLY\')").collect()
             except Exception as e:
                 errors.append(f"ADD_NOTIFICATION_THRESHOLD(80): {{str(e)[:120]}}")
 
         if notify_100:
             try:
-                session.sql(f"CALL {{fq}}!ADD_NOTIFICATION_THRESHOLD(100, \'ACTUAL\', TRUE)").collect()
+                session.sql(f"CALL {{fq}}!ADD_NOTIFICATION_THRESHOLD(100, \'ACTUAL\', TRUE, \'MONTHLY\')").collect()
             except Exception as e:
                 errors.append(f"ADD_NOTIFICATION_THRESHOLD(100): {{str(e)[:120]}}")
 
@@ -1782,7 +1785,8 @@ def handler(session, action, quota_name, params):
 
     elif action == "GET_ACTIVE_BLOCKS":
         try:
-            r = session.sql(f"CALL {{fq}}!GET_ACTIVE_BLOCKS()").collect()
+            # GA: GET_ACTIVE_BLOCKS() replaced by GET_ACTIVE_BLOCKS_V2()
+            r = session.sql(f"CALL {{fq}}!GET_ACTIVE_BLOCKS_V2()").collect()
             return {{"ok": True, "blocks": [dict(row.asDict()) for row in r]}}
         except Exception as e:
             return {{"ok": False, "error": str(e)[:300]}}
