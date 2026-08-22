@@ -755,8 +755,7 @@ def handler(session, lookback_hours):
                    )) AS ENTRYPOINT
             FROM SNOWFLAKE.LOCAL.AI_OBSERVABILITY_EVENTS e
             LEFT JOIN SNOWFLAKE.LOCAL.AI_OBSERVABILITY_EVENTS run
-                ON  run.RECORD_ATTRIBUTES['snow.ai.observability.agent.request_id']::STRING
-                  = e.RECORD_ATTRIBUTES['snow.ai.observability.agent.planning.request_id']::STRING
+                ON  run.TRACE['trace_id']::STRING = e.TRACE['trace_id']::STRING
                 AND run.RECORD:name::STRING = 'CodingAgentRun'
                 AND run.RECORD_TYPE = 'SPAN'
             WHERE e.RECORD_TYPE='SPAN' AND e.RECORD:name::STRING='CodingAgent.Step-0'
